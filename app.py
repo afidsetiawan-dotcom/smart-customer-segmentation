@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import streamlit as st
@@ -14,6 +15,14 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 
 DATA_DIR = BASE_DIR / "data" / "processed"
+APP_MODE = os.environ.get("APP_MODE", "direct").strip().lower()
+REQUIRED_COLUMNS = {
+    "CustomerID",
+    "Recency",
+    "Frequency",
+    "Monetary",
+    "Cluster",
+}
 
 st.set_page_config(
     page_title="Smart Customer Segmentation",
@@ -86,9 +95,36 @@ class EmptyAPIDataError(ValueError):
     """Menandai respons API valid yang belum berisi data pelanggan."""
 
 
+def validate_data_columns(df, source):
+    """Memastikan sumber data memiliki kolom yang digunakan aplikasi."""
+
+    missing_columns = REQUIRED_COLUMNS.difference(df.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(
+            f"{source} tidak memiliki kolom wajib: {missing}."
+        )
+
+
 @st.cache_data(ttl=60)
-def load_data():
-    """Mengambil data segmentasi pelanggan dari Django API."""
+def load_data(mode):
+    """Memuat data segmentasi melalui API Django atau CSV lokal."""
+
+    if mode == "direct":
+        csv_path = DATA_DIR / "customer_segments.csv"
+        if not csv_path.is_file():
+            raise FileNotFoundError(
+                f"File data segmentasi tidak ditemukan: {csv_path}."
+            )
+
+        df = pd.read_csv(csv_path)
+        validate_data_columns(df, "File CSV")
+        return df
+
+    if mode != "django":
+        raise ValueError(
+            "APP_MODE harus bernilai 'direct' atau 'django'."
+        )
 
     api_url = "http://127.0.0.1:8000/api/segments/"
     response = requests.get(api_url, timeout=30)
@@ -125,20 +161,7 @@ def load_data():
         )
 
     df = pd.DataFrame.from_records(data)
-    required_columns = {
-        "CustomerID",
-        "Recency",
-        "Frequency",
-        "Monetary",
-        "Cluster",
-    }
-    missing_columns = required_columns.difference(df.columns)
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"Respons Django API tidak memiliki kolom wajib: {missing}."
-        )
-
+    validate_data_columns(df, "Respons Django API")
     return df
 
 
@@ -191,7 +214,7 @@ def load_evaluation():
 
 df = None
 try:
-    df = load_data()
+    df = load_data(APP_MODE)
 except requests.exceptions.Timeout:
     st.error("Permintaan ke Django API melewati batas waktu.")
     st.stop()
@@ -215,16 +238,19 @@ except requests.exceptions.RequestException as exc:
 except EmptyAPIDataError as exc:
     st.warning(str(exc))
     st.stop()
-except (RuntimeError, ValueError) as exc:
-    st.error(f"Gagal membaca data dari Django API: {exc}")
+except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+    source = "Django API" if APP_MODE == "django" else "file CSV"
+    st.error(f"Gagal membaca data dari {source}: {exc}")
     st.stop()
 
 if df is None:
-    st.error("Data pelanggan tidak berhasil dimuat dari Django API.")
+    source = "Django API" if APP_MODE == "django" else "file CSV"
+    st.error(f"Data pelanggan tidak berhasil dimuat dari {source}.")
     st.stop()
 
 if df.empty:
-    st.warning("Data pelanggan dari Django API masih kosong.")
+    source = "Django API" if APP_MODE == "django" else "file CSV"
+    st.warning(f"Data pelanggan dari {source} masih kosong.")
     st.stop()
 
 
