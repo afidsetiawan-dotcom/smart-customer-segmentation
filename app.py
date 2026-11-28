@@ -23,6 +23,29 @@ REQUIRED_COLUMNS = {
     "Monetary",
     "Cluster",
 }
+RFM_COLUMNS = {"CustomerID", "Recency", "Frequency", "Monetary"}
+EVALUATION_COLUMNS = {"K", "Inertia", "Silhouette", "Davies_Bouldin"}
+TRANSACTION_COLUMNS = {
+    "InvoiceNo",
+    "StockCode",
+    "Description",
+    "Quantity",
+    "InvoiceDate",
+    "UnitPrice",
+    "CustomerID",
+    "Country",
+    "TotalPrice",
+}
+SEGMENT_NAMES = {
+    0: "High Value Customers",
+    1: "At Risk Customers",
+    2: "Regular Customers",
+}
+RFM_LABELS = {
+    "Recency": "Hari sejak transaksi terakhir",
+    "Frequency": "Jumlah transaksi",
+    "Monetary": "Total belanja (£)",
+}
 
 st.set_page_config(
     page_title="Smart Customer Segmentation",
@@ -95,14 +118,35 @@ class EmptyAPIDataError(ValueError):
     """Menandai respons API valid yang belum berisi data pelanggan."""
 
 
+def validate_required_columns(data, required_columns, source):
+    """Memastikan data memiliki kolom yang dibutuhkan."""
+
+    missing_columns = required_columns.difference(data.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"{source} tidak memiliki kolom wajib: {missing}.")
+
+
 def validate_data_columns(df, source):
     """Memastikan sumber data memiliki kolom yang digunakan aplikasi."""
 
-    missing_columns = REQUIRED_COLUMNS.difference(df.columns)
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
+    validate_required_columns(df, REQUIRED_COLUMNS, source)
+
+    for column in ("Recency", "Frequency", "Monetary", "Cluster"):
+        try:
+            df[column] = pd.to_numeric(df[column], errors="raise")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Kolom {column} pada {source} harus berisi angka."
+            ) from exc
+
+    missing_values = [
+        column for column in REQUIRED_COLUMNS if df[column].isna().any()
+    ]
+    if missing_values:
+        columns = ", ".join(sorted(missing_values))
         raise ValueError(
-            f"{source} tidak memiliki kolom wajib: {missing}."
+            f"{source} memiliki nilai kosong pada kolom wajib: {columns}."
         )
 
 
@@ -179,9 +223,14 @@ menu = st.sidebar.radio(
     [
         "Dashboard",
         "Customer Segmentation",
-        "Model Evaluation",
+        "RFM Analysis",
+        "Clustering Evaluation",
         "Dataset"
-    ]
+    ],
+    key="navigation",
+)
+st.sidebar.caption(
+    "Pilih halaman untuk berpindah antara ringkasan, analisis, dan data."
 )
 
 st.sidebar.markdown("---")
@@ -195,21 +244,210 @@ def load_evaluation():
 
     evaluation_path = DATA_DIR / "cluster_evaluation.csv"
     if not evaluation_path.is_file():
-        raise FileNotFoundError("File evaluasi clustering tidak ditemukan.")
+        raise FileNotFoundError(
+            f"File evaluasi clustering tidak ditemukan: {evaluation_path}."
+        )
 
     evaluation = pd.read_csv(evaluation_path)
     if evaluation.empty:
         raise ValueError("File evaluasi clustering kosong.")
 
-    required_columns = {"K", "Inertia", "Silhouette", "Davies_Bouldin"}
-    missing_columns = required_columns.difference(evaluation.columns)
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
+    validate_required_columns(
+        evaluation,
+        EVALUATION_COLUMNS,
+        "File evaluasi clustering",
+    )
+    for column in EVALUATION_COLUMNS:
+        try:
+            evaluation[column] = pd.to_numeric(
+                evaluation[column],
+                errors="raise",
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Kolom {column} pada file evaluasi harus berisi angka."
+            ) from exc
+
+    if evaluation[list(EVALUATION_COLUMNS)].isna().any().any():
         raise ValueError(
-            f"File evaluasi tidak memiliki kolom wajib: {missing}."
+            "File evaluasi clustering memiliki nilai kosong."
         )
 
-    return evaluation
+    evaluation = evaluation[evaluation["K"].between(2, 8)].copy()
+    if evaluation["K"].duplicated().any():
+        raise ValueError(
+            "File evaluasi clustering memiliki nilai K yang berulang."
+        )
+
+    missing_k = set(range(2, 9)).difference(
+        evaluation["K"].astype(int)
+    )
+    if missing_k:
+        missing = ", ".join(str(k) for k in sorted(missing_k))
+        raise ValueError(
+            f"File evaluasi clustering tidak memiliki hasil untuk K: {missing}."
+        )
+
+    return evaluation.sort_values("K")
+
+
+@st.cache_data(ttl=60)
+def load_rfm_data():
+    """Membaca data RFM pelanggan dari CSV hasil pemrosesan."""
+
+    rfm_path = DATA_DIR / "rfm_data.csv"
+    if not rfm_path.is_file():
+        raise FileNotFoundError(f"File data RFM tidak ditemukan: {rfm_path}.")
+
+    rfm_data = pd.read_csv(rfm_path)
+    if rfm_data.empty:
+        raise ValueError("File data RFM kosong.")
+
+    validate_required_columns(rfm_data, RFM_COLUMNS, "File data RFM")
+    for column in ("Recency", "Frequency", "Monetary"):
+        try:
+            rfm_data[column] = pd.to_numeric(
+                rfm_data[column],
+                errors="raise",
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Kolom {column} pada file data RFM harus berisi angka."
+            ) from exc
+
+    if rfm_data[list(RFM_COLUMNS)].isna().any().any():
+        raise ValueError("File data RFM memiliki nilai kosong.")
+
+    return rfm_data
+
+
+@st.cache_data(ttl=60)
+def load_transaction_preview():
+    """Menghitung baris transaksi dan memuat preview secara bertahap."""
+
+    transaction_path = DATA_DIR / "cleaned_retail.csv"
+    if not transaction_path.is_file():
+        raise FileNotFoundError(
+            f"File data transaksi tidak ditemukan: {transaction_path}."
+        )
+
+    header = pd.read_csv(transaction_path, nrows=0)
+    validate_required_columns(
+        header,
+        TRANSACTION_COLUMNS,
+        "File data transaksi",
+    )
+
+    preview = pd.read_csv(transaction_path, nrows=10)
+    row_count = 0
+    for chunk in pd.read_csv(
+        transaction_path,
+        usecols=["InvoiceNo"],
+        chunksize=100_000,
+    ):
+        row_count += len(chunk)
+
+    if row_count == 0 or preview.empty:
+        raise ValueError("File data transaksi kosong.")
+
+    return row_count, header.columns.tolist(), preview
+
+
+def summarize_clusters(data):
+    """Menghitung ukuran dan karakteristik aktual setiap cluster."""
+
+    summary = (
+        data.groupby("Cluster")
+        .agg(
+            Customers=("CustomerID", "nunique"),
+            Recency=("Recency", "mean"),
+            Frequency=("Frequency", "mean"),
+            Monetary=("Monetary", "mean"),
+            MonetaryTotal=("Monetary", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"MonetaryTotal": "Monetary Total"})
+    )
+    customer_count = data["CustomerID"].nunique()
+    summary["Customer Share (%)"] = (
+        summary["Customers"] / customer_count * 100
+    )
+    total_monetary = data["Monetary"].sum()
+    summary["Monetary Contribution (%)"] = (
+        summary["Monetary Total"] / total_monetary * 100
+        if total_monetary != 0
+        else 0
+    )
+    summary["Segment"] = summary["Cluster"].map(
+        lambda cluster: SEGMENT_NAMES.get(
+            int(cluster),
+            f"Cluster {cluster}",
+        )
+    )
+    return summary
+
+
+def describe_cluster(row, profile):
+    """Membuat interpretasi dan strategi dari perbandingan nilai RFM aktual."""
+
+    def relative_position(metric):
+        values = profile[metric]
+        if values.nunique() == 1:
+            return "setara"
+        if row[metric] == values.min():
+            return "terendah"
+        if row[metric] == values.max():
+            return "tertinggi"
+        return "menengah"
+
+    recency_position = relative_position("Recency")
+    frequency_position = relative_position("Frequency")
+    monetary_position = relative_position("Monetary")
+    recency_text = {
+        "terendah": "lebih baru bertransaksi",
+        "tertinggi": "paling lama tidak bertransaksi",
+        "menengah": "memiliki Recency di tingkat menengah",
+        "setara": "memiliki Recency yang setara dengan cluster lain",
+    }[recency_position]
+    frequency_text = {
+        "terendah": "paling jarang bertransaksi",
+        "tertinggi": "paling sering bertransaksi",
+        "menengah": "memiliki Frequency di tingkat menengah",
+        "setara": "memiliki Frequency yang setara dengan cluster lain",
+    }[frequency_position]
+    monetary_text = {
+        "terendah": "rata-rata belanja terendah",
+        "tertinggi": "rata-rata belanja tertinggi",
+        "menengah": "memiliki rata-rata belanja di tingkat menengah",
+        "setara": "memiliki Monetary rata-rata yang setara dengan cluster lain",
+    }[monetary_position]
+    characteristics = (
+        f"Relatif terhadap cluster lain, pelanggan di sini {recency_text}, "
+        f"{frequency_text}, dan {monetary_text}."
+    )
+
+    if recency_position == "tertinggi":
+        strategy = (
+            "Prioritaskan kampanye win-back yang terarah; uji pengingat "
+            "dan insentif pembelian kembali pada pelanggan yang lama tidak aktif."
+        )
+    elif monetary_position == "tertinggi":
+        strategy = (
+            "Pertahankan pelanggan bernilai tinggi melalui layanan loyalitas "
+            "dan rekomendasi yang relevan; hindari diskon massal yang tidak perlu."
+        )
+    elif frequency_position == "terendah":
+        strategy = (
+            "Dorong transaksi berikutnya dengan pengingat yang relevan, "
+            "bundel, atau manfaat loyalitas setelah pembelian."
+        )
+    else:
+        strategy = (
+            "Dorong pembelian berulang dan cross-sell yang relevan, lalu "
+            "ukur respons sebelum memperluas promosi."
+        )
+
+    return characteristics, strategy
 
 
 df = None
@@ -256,14 +494,14 @@ if df.empty:
 
 if menu == "Dashboard":
     st.markdown(
-        '<div class="main-title">Dashboard Overview</div>',
+        '<div class="main-title">Dashboard</div>',
         unsafe_allow_html=True
     )
 
     st.markdown(
         '<div class="subtitle">'
-        'Analisis dan segmentasi perilaku pelanggan '
-        'berdasarkan transaksi e-commerce.'
+        'Ringkasan data per pelanggan: RFM merangkum kebaruan, frekuensi, '
+        'dan nilai belanja; K-Means mengelompokkan pelanggan dengan pola RFM serupa.'
         '</div>',
         unsafe_allow_html=True
     )
@@ -275,102 +513,219 @@ if menu == "Dashboard":
 
     col1, col2, col3, col4 = st.columns(4)
 
-    col1.metric("Total Customers", f"{total_customers:,}")
+    col1.metric(
+        "Total Customers",
+        f"{total_customers:,}",
+        help="Jumlah CustomerID unik yang tercakup dalam hasil segmentasi.",
+    )
     col2.metric(
         "Total Revenue",
         f"£{total_revenue / 1_000_000:.2f}M",
-        help=f"Total penjualan: £{total_revenue:,.2f}"
+        help=(
+            "Jumlah Monetary seluruh pelanggan pada data segmentasi: "
+            f"£{total_revenue:,.2f}."
+        ),
     )
-    col3.metric("Customer Segments", total_clusters)
-    col4.metric("Average Frequency", f"{avg_frequency:.2f}")
+    col3.metric(
+        "Customer Segments",
+        total_clusters,
+        help="Jumlah label cluster yang terdapat pada data segmentasi.",
+    )
+    col4.metric(
+        "Average Frequency",
+        f"{avg_frequency:.2f}",
+        help="Rata-rata jumlah invoice unik per pelanggan dalam periode dataset.",
+    )
 
     st.markdown("---")
 
+    cluster_summary = summarize_clusters(df)
     left, right = st.columns(2)
-    cluster_counts = (
-        df["Cluster"]
-        .value_counts()
-        .sort_index()
-        .reset_index()
-    )
-    cluster_counts.columns = ["Cluster", "Customers"]
-    cluster_counts["Segment"] = cluster_counts["Cluster"].map(
-        lambda cluster: f"Cluster {cluster}"
-    )
 
     with left:
         st.subheader("Customer Distribution")
         fig = px.pie(
-            cluster_counts,
+            cluster_summary,
             names="Segment",
             values="Customers",
             hole=0.55,
             title="Distribusi Pelanggan"
         )
-        st.plotly_chart(fig, width="stretch")
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            alt="Proporsi pelanggan pada setiap segmen",
+        )
 
     with right:
         st.subheader("Customer Segments")
         fig = px.bar(
-            cluster_counts,
+            cluster_summary,
             x="Segment",
-            y="Customers",
+            y="Monetary Total",
             color="Segment",
-            title="Jumlah Pelanggan per Segmen",
-            text="Customers"
+            title="Kontribusi Monetary per Segmen",
+            labels={
+                "Segment": "Segmen pelanggan",
+                "Monetary Total": "Total nilai belanja (£)",
+            },
+            text="Monetary Total",
+            hover_data={"Monetary Contribution (%)": ":.2f"},
         )
-        fig.update_traces(textposition="outside")
-        st.plotly_chart(fig, width="stretch")
+        fig.update_traces(
+            texttemplate="£%{y:,.0f}",
+            textposition="outside",
+        )
+        fig.update_yaxes(tickprefix="£", tickformat=",.0f")
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            alt="Kontribusi nilai Monetary dari setiap segmen pelanggan",
+        )
 
     st.markdown("---")
     st.subheader("RFM Overview")
-    rfm_summary = df[
-        ["Recency", "Frequency", "Monetary"]
-    ].mean().reset_index()
-    rfm_summary.columns = ["Metric", "Average"]
-
-    fig = px.bar(
-        rfm_summary,
-        x="Metric",
-        y="Average",
-        color="Metric",
-        title="Rata-rata Nilai RFM"
+    rfm_means = df[["Recency", "Frequency", "Monetary"]].mean()
+    rfm_cols = st.columns(3)
+    rfm_cols[0].metric(
+        "Average Recency",
+        f"{rfm_means['Recency']:.1f} days",
+        help=(
+            "Rata-rata hari sejak transaksi terakhir; lebih kecil berarti "
+            "lebih baru bertransaksi."
+        ),
     )
-    st.plotly_chart(fig, width="stretch")
+    rfm_cols[1].metric(
+        "Mean Frequency per Customer",
+        f"{rfm_means['Frequency']:.2f} transactions",
+        help="Rata-rata jumlah invoice unik per pelanggan dalam periode dataset.",
+    )
+    rfm_cols[2].metric(
+        "Average Monetary",
+        f"£{rfm_means['Monetary']:,.2f}",
+        help="Rata-rata total belanja per pelanggan.",
+    )
 
     st.subheader("Customer Data Preview")
-    st.dataframe(df.head(10), width="stretch", hide_index=True)
+    st.dataframe(
+        df.head(10),
+        width="stretch",
+        hide_index=True,
+        alt="Preview data pelanggan hasil clustering",
+    )
 
 elif menu == "Customer Segmentation":
     st.title("Customer Segmentation")
     st.write(
-        "Analisis karakteristik pelanggan berdasarkan "
-        "hasil algoritma K-Means."
+        "K-Means mengelompokkan pelanggan berdasarkan kemiripan nilai RFM. "
+        "Nilai RFM dan kontribusi Monetary di bawah dihitung langsung dari "
+        "data pelanggan pada setiap cluster."
     )
 
-    profile = df.groupby("Cluster").agg(
-        Jumlah_Pelanggan=("CustomerID", "count"),
-        Recency=("Recency", "mean"),
-        Frequency=("Frequency", "mean"),
-        Monetary=("Monetary", "mean")
-    ).round(2)
+    profile = summarize_clusters(df)
 
-    st.subheader("Cluster Profile")
-    st.dataframe(profile, width="stretch")
+    st.subheader("Distribusi Cluster")
+    distribution_chart = px.bar(
+        profile,
+        x="Segment",
+        y="Customers",
+        color="Segment",
+        text="Customers",
+        title="Jumlah dan Proporsi Pelanggan per Segmen",
+        hover_data={"Customer Share (%)": ":.2f"},
+    )
+    distribution_chart.update_traces(textposition="outside")
+    st.plotly_chart(
+        distribution_chart,
+        width="stretch",
+        alt="Jumlah dan persentase pelanggan pada setiap cluster",
+    )
+
+    profile_table = profile[
+        [
+            "Cluster",
+            "Segment",
+            "Customers",
+            "Customer Share (%)",
+            "Recency",
+            "Frequency",
+            "Monetary",
+            "Monetary Total",
+            "Monetary Contribution (%)",
+        ]
+    ].rename(
+        columns={
+            "Customers": "Jumlah Pelanggan",
+            "Customer Share (%)": "Porsi Pelanggan (%)",
+            "Recency": "Rata-rata Recency (hari)",
+            "Frequency": "Rata-rata Frequency (transaksi)",
+            "Monetary": "Rata-rata Monetary (£)",
+            "Monetary Total": "Total Monetary (£)",
+            "Monetary Contribution (%)": "Kontribusi Monetary (%)",
+        }
+    ).round(2)
+    for column in ("Rata-rata Monetary (£)", "Total Monetary (£)"):
+        profile_table[column] = profile_table[column].map(
+            lambda value: f"£{value:,.2f}"
+        )
+    st.subheader("Karakteristik RFM per Cluster")
+    st.dataframe(
+        profile_table,
+        width="stretch",
+        hide_index=True,
+        alt="Perbandingan ukuran dan nilai RFM setiap cluster",
+    )
+
+    st.subheader("Karakteristik dan Strategi Pemasaran")
+    segment_cards = st.columns(max(len(profile), 1))
+    for column, (_, row) in zip(segment_cards, profile.iterrows()):
+        cluster_id = int(row["Cluster"])
+        characteristics, strategy = describe_cluster(row, profile)
+        with column:
+            with st.container(border=True):
+                st.subheader(row["Segment"])
+                st.caption(
+                    f"Cluster {cluster_id} · "
+                    f"{row['Customers']:,} pelanggan · "
+                    f"{row['Customer Share (%)']:.1f}% dari pelanggan"
+                )
+                st.write(characteristics)
+                st.write(
+                    f"Rata-rata: Recency {row['Recency']:.1f} hari, "
+                    f"Frequency {row['Frequency']:.2f} transaksi, "
+                    f"Monetary £{row['Monetary']:,.2f}."
+                )
+                st.write(
+                    f"Kontribusi Monetary: £{row['Monetary Total']:,.2f} "
+                    f"({row['Monetary Contribution (%)']:.2f}% dari total)."
+                )
+                st.markdown(f"**Strategi:** {strategy}")
 
     selected_cluster = st.selectbox(
         "Pilih Cluster",
-        sorted(df["Cluster"].unique())
+        sorted(df["Cluster"].unique()),
     )
 
     filtered = df[df["Cluster"] == selected_cluster]
 
+    selected_name = SEGMENT_NAMES.get(
+        int(selected_cluster),
+        f"Cluster {selected_cluster}",
+    )
+    st.subheader(f"Daftar Pelanggan — {selected_name}")
     st.metric(
         "Jumlah Pelanggan",
-        f"{len(filtered):,}"
+        f"{filtered['CustomerID'].nunique():,}",
+        help="Jumlah pelanggan unik di cluster yang dipilih.",
     )
 
-    st.dataframe(filtered, width="stretch", hide_index=True)
+    st.dataframe(
+        filtered,
+        width="stretch",
+        hide_index=True,
+        alt=f"Data pelanggan pada segmen {selected_name}",
+    )
 
     csv = filtered.to_csv(index=False).encode("utf-8")
 
@@ -382,57 +737,221 @@ elif menu == "Customer Segmentation":
     )
 
 
+elif menu == "RFM Analysis":
+    st.title("RFM Analysis")
+    st.write(
+        "RFM menyederhanakan riwayat transaksi menjadi tiga metrik per pelanggan. "
+        "Grafik menggunakan data agregat yang sama dengan hasil segmentasi."
+    )
+
+    try:
+        rfm_data = load_rfm_data()
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        st.error(f"Analisis RFM tidak dapat dimuat: {exc}")
+        st.stop()
+
+    st.metric(
+        "Pelanggan dianalisis",
+        f"{rfm_data['CustomerID'].nunique():,}",
+        help="Jumlah CustomerID unik pada file hasil perhitungan RFM.",
+    )
+
+    rfm_summary = rfm_data[
+        ["Recency", "Frequency", "Monetary"]
+    ].describe().T
+    rfm_summary.index.name = "Metrik"
+    rfm_summary = rfm_summary.reset_index()
+    rfm_summary["Metrik"] = rfm_summary["Metrik"].map(RFM_LABELS)
+    monetary_row = rfm_summary["Metrik"] == RFM_LABELS["Monetary"]
+    for column in ("mean", "std", "min", "25%", "50%", "75%", "max"):
+        rfm_summary[column] = rfm_summary[column].map(
+            lambda value: f"{value:,.2f}"
+        )
+        rfm_summary.loc[monetary_row, column] = (
+            "£" + rfm_summary.loc[monetary_row, column]
+        )
+    st.subheader("Ringkasan Statistik RFM")
+    st.dataframe(
+        rfm_summary.round(2),
+        width="stretch",
+        hide_index=True,
+        alt="Statistik ringkasan Recency, Frequency, dan Monetary",
+    )
+
+    st.subheader("Distribusi RFM")
+    chart_columns = st.columns(3)
+    for column, metric in zip(
+        chart_columns,
+        ("Recency", "Frequency", "Monetary"),
+    ):
+        figure = px.histogram(
+            rfm_data,
+            x=metric,
+            nbins=40,
+            title=RFM_LABELS[metric],
+            labels={metric: RFM_LABELS[metric]},
+        )
+        figure.update_layout(yaxis_title="Jumlah pelanggan")
+        if metric in {"Frequency", "Monetary"} and (
+            rfm_data[metric] > 0
+        ).all():
+            figure.update_xaxes(type="log")
+        if metric == "Monetary":
+            figure.update_xaxes(tickprefix="£", tickformat=",.0f")
+        elif metric == "Frequency":
+            figure.update_xaxes(title_text="Jumlah transaksi (skala log)")
+        else:
+            figure.update_xaxes(title_text="Hari sejak transaksi terakhir")
+        figure.update_yaxes(title_text="Jumlah pelanggan")
+        with column:
+            st.plotly_chart(
+                figure,
+                width="stretch",
+                alt=f"Distribusi pelanggan berdasarkan {RFM_LABELS[metric]}",
+            )
+
+    st.subheader("Arti Metrik")
+    explanation_columns = st.columns(3)
+    explanations = (
+        (
+            "Recency",
+            "Jumlah hari sejak pelanggan terakhir kali bertransaksi. "
+            "Nilai lebih kecil berarti pelanggan lebih baru berbelanja.",
+        ),
+        (
+            "Frequency",
+            "Jumlah transaksi pelanggan dalam periode data. "
+            "Nilai lebih besar berarti pelanggan lebih sering berbelanja.",
+        ),
+        (
+            "Monetary",
+            "Total nilai belanja pelanggan. Nilai lebih besar menunjukkan "
+            "kontribusi belanja yang lebih tinggi.",
+        ),
+    )
+    for column, (metric, description) in zip(
+        explanation_columns,
+        explanations,
+    ):
+        with column:
+            with st.container(border=True):
+                st.markdown(f"**{metric}**")
+                st.write(description)
+
+
 # ==========================================
 # MODEL EVALUATION
 # ==========================================
 
-elif menu == "Model Evaluation":
-    st.title("Model Evaluation")
+elif menu == "Clustering Evaluation":
+    st.title("Clustering Evaluation")
+    st.write(
+        "Halaman ini membandingkan hasil evaluasi yang sudah tersimpan untuk "
+        "K=2 sampai K=8; tidak ada pelatihan ulang saat aplikasi dibuka."
+    )
 
     try:
         evaluation = load_evaluation()
-    except (FileNotFoundError, ValueError, pd.errors.ParserError) as exc:
+    except (FileNotFoundError, OSError, ValueError) as exc:
         st.error(f"Evaluasi model tidak dapat dimuat: {exc}")
         st.stop()
 
-    st.subheader("Cluster Evaluation Results")
-    st.dataframe(evaluation, width="stretch", hide_index=True)
+    st.subheader("Hasil evaluasi cluster")
+    st.caption(
+        "Inertia mengukur kekompakan dalam cluster (lebih rendah lebih baik, "
+        "namun biasanya turun saat K bertambah). Silhouette mengukur pemisahan "
+        "cluster (lebih tinggi lebih baik). Davies-Bouldin mengukur kemiripan "
+        "antarcluster (lebih rendah lebih baik)."
+    )
+    st.dataframe(
+        evaluation.round(4),
+        width="stretch",
+        hide_index=True,
+        alt="Perbandingan metrik evaluasi untuk K dua hingga delapan",
+    )
 
     fig = px.line(
         evaluation,
         x="K",
         y="Inertia",
         markers=True,
-        title="Elbow Method"
+        title="Elbow Method",
+        labels={
+            "K": "Jumlah cluster (K)",
+            "Inertia": "Inertia (jumlah kuadrat jarak)",
+        },
     )
-
-    st.plotly_chart(fig, width="stretch")
+    fig.update_xaxes(tickmode="linear", dtick=1)
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        alt="Inertia menurun saat jumlah cluster bertambah dari dua sampai delapan",
+    )
 
     fig = px.line(
         evaluation,
         x="K",
         y="Silhouette",
         markers=True,
-        title="Silhouette Score"
+        title="Silhouette Score",
+        labels={
+            "K": "Jumlah cluster (K)",
+            "Silhouette": "Silhouette score",
+        },
     )
-
-    st.plotly_chart(fig, width="stretch")
+    fig.update_xaxes(tickmode="linear", dtick=1)
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        alt="Silhouette score untuk setiap jumlah cluster yang diuji",
+    )
 
     fig = px.line(
         evaluation,
         x="K",
         y="Davies_Bouldin",
         markers=True,
-        title="Davies-Bouldin Index"
+        title="Davies-Bouldin Index",
+        labels={
+            "K": "Jumlah cluster (K)",
+            "Davies_Bouldin": "Davies-Bouldin Index",
+        },
+    )
+    fig.update_xaxes(tickmode="linear", dtick=1)
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        alt="Davies-Bouldin Index untuk setiap jumlah cluster yang diuji",
     )
 
-    st.plotly_chart(fig, width="stretch")
+    best_silhouette = evaluation.loc[evaluation["Silhouette"].idxmax()]
+    best_davies_bouldin = evaluation.loc[
+        evaluation["Davies_Bouldin"].idxmin()
+    ]
+    k2_inertia = evaluation.loc[evaluation["K"] == 2, "Inertia"].iloc[0]
+    k3_inertia = evaluation.loc[evaluation["K"] == 3, "Inertia"].iloc[0]
+    k4_inertia = evaluation.loc[evaluation["K"] == 4, "Inertia"].iloc[0]
 
-    st.info(
-        "Model final menggunakan K=3 berdasarkan "
-        "Silhouette Score tertinggi dan "
-        "Davies-Bouldin Index terendah."
-    )
+    if (
+        int(best_silhouette["K"]) == 3
+        and int(best_davies_bouldin["K"]) == 3
+    ):
+        st.info(
+            "K=3 dipilih karena hasil aktual memberikan Silhouette Score "
+            f"tertinggi ({best_silhouette['Silhouette']:.4f}) dan "
+            "Davies-Bouldin Index terendah "
+            f"({best_davies_bouldin['Davies_Bouldin']:.4f}). "
+            f"Inertia turun dari {k2_inertia:,.2f} (K=2) menjadi "
+            f"{k3_inertia:,.2f} (K=3); penurunan berikutnya ke K=4 "
+            f"lebih kecil ({k3_inertia - k4_inertia:,.2f})."
+        )
+    else:
+        st.info(
+            "Evaluasi aktual menunjukkan Silhouette Score tertinggi pada "
+            f"K={int(best_silhouette['K'])} dan Davies-Bouldin Index "
+            f"terendah pada K={int(best_davies_bouldin['K'])}. "
+            "Model dan hasil clustering yang ada tetap menggunakan K=3."
+        )
 
 
 # ==========================================
@@ -440,28 +959,58 @@ elif menu == "Model Evaluation":
 # ==========================================
 
 elif menu == "Dataset":
-    st.title("Dataset Information")
-
-    st.write(
-        "Dataset Online Retail dari UCI Machine Learning Repository."
+    st.title("Dataset")
+    st.markdown(
+        "Sumber transaksi: [UCI Machine Learning Repository — "
+        "Online Retail](https://archive.ics.uci.edu/dataset/352/online+retail). "
+        "CSV transaksi berikut berisi baris transaksi setelah pembersihan; "
+        "data pelanggan di bawahnya merupakan hasil agregasi RFM dan clustering. "
+        "Gunakan bagian transaksi untuk melihat baris item, dan bagian pelanggan "
+        "untuk melihat ringkasan per CustomerID."
     )
 
-    st.metric("Total Records", f"{len(df):,}")
+    try:
+        transaction_rows, transaction_columns, transaction_preview = (
+            load_transaction_preview()
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        st.error(f"Informasi data transaksi tidak dapat dimuat: {exc}")
+        st.stop()
 
-    st.metric(
-        "Total Customers",
-        f"{df['CustomerID'].nunique():,}"
+    st.subheader("Data Transaksi")
+    st.caption(
+        "Satu baris merepresentasikan item transaksi setelah pembersihan; "
+        "data ini tetap berbeda dari agregat pelanggan."
     )
-
-    st.subheader("Dataset Preview")
-    st.dataframe(df, width="stretch", hide_index=True)
-
-    st.subheader("Statistical Description")
-
+    transaction_metrics = st.columns(2)
+    transaction_metrics[0].metric("Jumlah Baris Transaksi", f"{transaction_rows:,}")
+    transaction_metrics[1].metric("Jumlah Kolom", len(transaction_columns))
+    st.write("Kolom:", ", ".join(transaction_columns))
     st.dataframe(
-        df[["Recency", "Frequency", "Monetary"]]
-        .describe(),
-        width="stretch"
+        transaction_preview,
+        width="stretch",
+        hide_index=True,
+        alt="Preview sepuluh baris data transaksi setelah pembersihan",
+    )
+
+    st.subheader("Data Agregat Pelanggan")
+    st.caption(
+        "Satu baris merepresentasikan satu pelanggan dengan metrik Recency, "
+        "Frequency, Monetary, dan label Cluster."
+    )
+    customer_metrics = st.columns(3)
+    customer_metrics[0].metric("Jumlah Baris Pelanggan", f"{len(df):,}")
+    customer_metrics[1].metric(
+        "Pelanggan Unik",
+        f"{df['CustomerID'].nunique():,}",
+    )
+    customer_metrics[2].metric("Jumlah Kolom", len(df.columns))
+    st.write("Kolom:", ", ".join(df.columns))
+    st.dataframe(
+        df.head(10),
+        width="stretch",
+        hide_index=True,
+        alt="Preview sepuluh baris data pelanggan hasil clustering",
     )
 
     csv = df.to_csv(index=False).encode("utf-8")
@@ -472,3 +1021,7 @@ elif menu == "Dataset":
         file_name="customer_segments.csv",
         mime="text/csv"
     )
+
+
+st.markdown("---")
+st.caption("App by Afid © 2026")
